@@ -1,6 +1,6 @@
 {
   "name": "@nxlabscc/agent-harness",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The turn and its persistence for LLM agents: sessions, tool access control, context assembly, providers and cost, with the queue and the memory as pluggable peers. Bun, TypeScript source.",
   "type": "module",
   "license": "Apache-2.0",
@@ -22,14 +22,14 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@nxlabscc/agent-context": "github:nxlabscc/agent-context#v0.1.0"
+    "@nxlabscc/agent-context": "^0.1.1"
   },
   "peerDependencies": {
     "@ai-sdk/anthropic": "^2.0.0",
     "@ai-sdk/deepseek": "^2.0.0",
     "@ai-sdk/openai-compatible": "^1.0.0",
-    "@nxlabscc/agent-memory": "github:nxlabscc/agent-memory#v0.1.0",
-    "@nxlabscc/agent-message-queue": "github:nxlabscc/agent-message-queue#v0.2.0",
+    "@nxlabscc/agent-memory": "^0.1.0",
+    "@nxlabscc/agent-message-queue": "^0.2.0",
     "ai": "^6.0.0",
     "zod": "^3.23.0"
   },
