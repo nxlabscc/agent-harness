@@ -1,6 +1,6 @@
 {
   "name": "@nxlabscc/agent-harness",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The turn and its persistence for LLM agents: sessions, tool access control, context assembly, providers and cost, with the queue and the memory as pluggable peers. Bun, TypeScript source.",
   "type": "module",
   "license": "Apache-2.0",
