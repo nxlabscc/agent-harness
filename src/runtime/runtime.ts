@@ -228,15 +228,43 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
   type TotalUsage = { inputTokens?: number; outputTokens?: number; inputTokenDetails?: { cacheReadTokens?: number; noCacheTokens?: number } } | undefined;
 
   /**
-   * A per-message tool-call sink: feed it each message as it is persisted and it
-   * records a tool call once its result lands, pairing the result with its call's
-   * input and the idx of the message that made the call. Driven per message so the
-   * tool_calls table fills through the turn, the same as the transcript, rather
-   * than all at once at its close.
+   * Tool-call instrumentation: a timing wrap for the tool set, and a per-message
+   * sink for the tool_calls table that share one call-id map.
+   *
+   * `wrap` times each tool's `execute` by its call id. `record`, fed each message
+   * as it is persisted, writes a tool call once its result lands — pairing the
+   * result with its call's input, the idx of the message that made the call, the
+   * message a failed tool returned, and the time the tool took. Driven per
+   * message so the tool_calls table fills through the turn, the same as the
+   * transcript, rather than all at once at its close.
    */
-  function toolCallRecorder(session: Session, scope: Scope): (idx: number, message: ModelMessage) => Promise<void> {
+  function toolInstrumentation(session: Session, scope: Scope) {
     const calls = new Map<string, { input: unknown; idx: number; toolName: string }>();
-    return async (idx, message) => {
+    const durations = new Map<string, number>();
+
+    const wrap = (toolSet: ToolSet): ToolSet => {
+      const out: ToolSet = {};
+      for (const [name, entry] of Object.entries(toolSet)) {
+        const t = entry as { execute?: (args: unknown, opts: { toolCallId: string }) => unknown };
+        if (typeof t.execute !== "function") { out[name] = entry; continue; }
+        const execute = t.execute.bind(t);
+        const timed = {
+          ...entry,
+          execute: async (args: unknown, opts: { toolCallId: string }) => {
+            const start = Date.now();
+            try {
+              return await execute(args, opts);
+            } finally {
+              if (opts?.toolCallId) durations.set(opts.toolCallId, Date.now() - start);
+            }
+          },
+        };
+        out[name] = timed as unknown as typeof entry;
+      }
+      return out;
+    };
+
+    const record = async (idx: number, message: ModelMessage): Promise<void> => {
       if (Array.isArray(message.content)) {
         for (const part of message.content) {
           const p = part as { type?: string; toolCallId?: string; toolName?: string; input?: unknown };
@@ -254,31 +282,62 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
           toolName: p.toolName ?? call?.toolName ?? "",
           input: call?.input,
           output: p.output,
-          durationMs: 0,
+          error: toolError(p.output),
+          durationMs: (p.toolCallId ? durations.get(p.toolCallId) : undefined) ?? 0,
         });
       }
     };
+
+    return { wrap, record };
   }
 
-  /** Usage, cost, the finish, the tool calls, and the after-turn hooks. The messages are already persisted. */
+  /**
+   * Bill a turn's accumulated usage: add it to the session's running total and
+   * write its one turn_usage row. The single path both a finished turn and a
+   * failed or closed one bill through, so a step the provider answered counts
+   * however the turn ends, and the two cannot drift apart. A turn that ran no
+   * step bills nothing, so neither leaves an empty row.
+   */
+  async function recordUsage(session: Session, p: Prepared, input: TurnInput<Extra>, usage: Usage): Promise<void> {
+    if (usage.steps === 0) return;
+    await store.addUsage(session.id, p.scope, usage);
+    await store.recordTurnUsage(p.scope, {
+      sessionId: session.id, turn: p.firstAssistantIdx - 1, provider: input.ref.provider, model: input.ref.model, usage,
+    });
+  }
+
+  /**
+   * Bill, finish, and run the after-turn hooks. `bill` is the turn's one biller,
+   * idempotent, so a failure later caught and billed by the turn's error path
+   * does not bill a second time. Tool calls were recorded as their results
+   * landed, so there is nothing to catch up here.
+   *
+   * Past `store.finish` the turn is finished and billed. The after-turn hooks are
+   * side effects of a finished turn, not part of it: a throw from `context.afterTurn`
+   * or `hooks.afterTurn` is reported to `onError` and leaves the turn finished,
+   * rather than re-billing it or turning it errored.
+   */
   async function finalize(
     session: Session, p: Prepared, input: TurnInput<Extra>,
-    persisted: StoredMessage[], usage: Usage, finishReason: string | null,
+    persisted: StoredMessage[], bill: () => Promise<void>, finishReason: string | null,
   ): Promise<TurnResult> {
     const { scope, firstAssistantIdx, request, turnContext } = p;
-    await store.addUsage(session.id, scope, usage);
-    await store.recordTurnUsage(scope, {
-      sessionId: session.id, turn: firstAssistantIdx - 1, provider: input.ref.provider, model: input.ref.model, usage,
-    });
-    // Tool calls were recorded as their results landed, so there is nothing to catch up here.
-
     const messages = persisted.filter((m) => m.idx >= firstAssistantIdx).map((m) => m.message);
     const summary = summaryOf(messages);
+    await bill();
     await store.finish(session.id, scope, { status: "finished", finishReason, summary, provider: input.ref.provider, model: input.ref.model });
 
     const result: TurnResult = { session, finishReason, summary, messages };
-    await context.afterTurn?.(request, { messages, history: (await store.listMessages(session.id, scope)).filter((x) => x.idx > 0) });
-    await hooks?.afterTurn?.(result, turnContext);
+    try {
+      await context.afterTurn?.(request, { messages, history: (await store.listMessages(session.id, scope)).filter((x) => x.idx > 0) });
+      await hooks?.afterTurn?.(result, turnContext);
+    } catch (err) {
+      try {
+        await hooks?.onError?.(err, turnContext);
+      } catch (e) {
+        log?.("after-turn hook and its onError both threw", { session: session.id, error: String(e) });
+      }
+    }
     return result;
   }
 
@@ -301,7 +360,9 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
     // the growing idx keep every message, in order.
     const persisted: StoredMessage[] = [];
     let nextIdx = p.firstAssistantIdx;
-    const recordTool = toolCallRecorder(session, p.scope);
+    const tooling = toolInstrumentation(session, p.scope);
+    const toolSet = tooling.wrap(p.toolSet);
+    const recordTool = tooling.record;
     const appendPersisted = async (message: ModelMessage) => {
       const at = nextIdx++;
       await store.appendMessage(session.id, p.scope, at, message);
@@ -313,6 +374,14 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
     // usage; runToEnd hands back the last run alone, so the totals are kept here
     // — otherwise a wrapped-up turn would bill only its wrap-up steps.
     let usage: Usage = ZERO_USAGE;
+    // The turn's one biller: idempotent, so the error path can bill what ran
+    // without billing again what finalize already did.
+    let billed = false;
+    const bill = async () => {
+      if (billed) return;
+      billed = true;
+      await recordUsage(session, p, input, usage);
+    };
     try {
       const run = async (messages: ModelMessage[], steps: number) => {
         // Persist each step's new messages as the step lands, so a turn in flight
@@ -333,18 +402,22 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
           model: input.model,
           system: p.system,
           messages,
-          tools: p.toolSet,
+          tools: toolSet,
           abortSignal: handle.signal,
           stopWhen: stepCountIs(steps),
           prepareStep: ({ steps: done, messages: msgs }) => context.prepareStep?.({ steps: done, messages: msgs }, p.request),
           onStepFinish: async (step) => {
             await flush(step.response.messages);
+            // Bill per step, not per run: a run that throws never returns its
+            // totalUsage, so the only place the steps it finished are counted is
+            // here. Summing step.usage over a run equals its totalUsage, so a
+            // run that completes bills the same as before.
+            usage = addUsage(usage, computeUsage(p.prices, step.usage as TotalUsage ?? {}, 1));
             hooks?.onStepFinish?.(session, step.response.messages, p.turnContext);
           },
         });
         // Catch any tail the step hooks did not reach, then settle the chain.
         await flush(result.response.messages);
-        usage = addUsage(usage, computeUsage(p.prices, result.totalUsage as TotalUsage ?? {}, result.steps.length));
         return result;
       };
 
@@ -356,8 +429,11 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
         { continueOnCut: config.continueOnCut, wrapUp: config.wrapUp },
       );
       const r = result as unknown as { finishReason?: string };
-      return await finalize(session, p, input, persisted, usage, r.finishReason ?? null);
+      return await finalize(session, p, input, persisted, bill, r.finishReason ?? null);
     } catch (err) {
+      // Bill the steps that ran before the failure, whichever way the turn ends.
+      // Idempotent: a failure after finalize already billed does not bill twice.
+      await bill();
       if (turns.abortedByClose(session.id)) {
         await store.finish(session.id, p.scope, { status: "finished", finishReason: "closed", summary: "Turn stopped: the session was closed." });
         return { session, finishReason: "closed", summary: null, messages: [] };
@@ -384,7 +460,18 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
       let streamIdx = p.firstAssistantIdx;
       let persistedInRun = 0;
       let chain: Promise<void> = Promise.resolve();
-      const recordTool = toolCallRecorder(session, p.scope);
+      const tooling = toolInstrumentation(session, p.scope);
+      const toolSet = tooling.wrap(p.toolSet);
+      const recordTool = tooling.record;
+      // Summed per step so a stream that fails still bills the steps it ran; the
+      // per-step sum equals the run's totalUsage, so a finished turn bills the same.
+      let usage: Usage = ZERO_USAGE;
+      let billed = false;
+      const bill = async () => {
+        if (billed) return;
+        billed = true;
+        await recordUsage(session, p, input, usage);
+      };
       const flush = (cumulative: readonly ModelMessage[]): Promise<void> => {
         chain = chain.then(async () => {
           for (; persistedInRun < cumulative.length; persistedInRun++) {
@@ -401,40 +488,56 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
         model: input.model,
         system: p.system,
         messages: p.sendMessages,
-        tools: p.toolSet,
+        tools: toolSet,
         abortSignal: handle.signal,
         stopWhen: stepCountIs(input.maxSteps ?? config.maxSteps.stream),
         prepareStep: ({ steps, messages }) => context.prepareStep?.({ steps, messages }, p.request),
         onStepFinish: async (step) => {
           await flush(step.response.messages);
+          usage = addUsage(usage, computeUsage(p.prices, step.usage as TotalUsage ?? {}, 1));
           hooks?.onStepFinish?.(session, step.response.messages, p.turnContext);
         },
         onError: ({ error }) => {
-          if (turns.abortedByClose(session.id)) {
-            void store.finish(session.id, p.scope, { status: "finished", finishReason: "closed", summary: "Turn stopped: the session was closed." });
-            settleDone({ session, finishReason: "closed", summary: null, messages: [] });
-            return;
-          }
-          void handleError(session, p, error).finally(() => rejectDone(error));
+          // Bill the steps that ran before the failure, then finish — closed if a
+          // close aborted the turn, errored otherwise.
+          void (async () => {
+            await bill();
+            if (turns.abortedByClose(session.id)) {
+              await store.finish(session.id, p.scope, { status: "finished", finishReason: "closed", summary: "Turn stopped: the session was closed." });
+              settleDone({ session, finishReason: "closed", summary: null, messages: [] });
+              return;
+            }
+            await handleError(session, p, error);
+            rejectDone(error);
+          })();
         },
-        onFinish: ({ response, totalUsage, finishReason, steps }) => {
+        onFinish: ({ response, finishReason }) => {
           void (async () => {
             // Catch any tail the step hooks did not reach, then finalize on the
-            // transcript the chain already persisted. The streamed path is a single
-            // run (no cut-reply/wrap-up continuation), so its usage is computed once.
+            // transcript the chain already persisted, billing the usage summed
+            // per step above.
             await flush(response.messages);
-            const usage = computeUsage(p.prices, totalUsage as TotalUsage ?? {}, steps.length);
-            return finalize(session, p, input, persisted, usage, finishReason ?? null);
+            return finalize(session, p, input, persisted, bill, finishReason ?? null);
           })().then(settleDone, rejectDone);
         },
       });
       // Drive the turn server-side so it finishes even if the client disconnects.
-      void result.consumeStream();
-      return result.toUIMessageStreamResponse({ headers: { "x-session-id": session.id } });
+      // A failure is delivered through `onError` above, which finishes the turn;
+      // the drive promise itself is caught so its rejection is not left unhandled.
+      // `consumeStream` returns a PromiseLike, so the rejection is taken on `then`.
+      result.consumeStream().then(undefined, () => {});
+      // The caller decides what a failed turn tells the client. The default
+      // surfaces the error's own message; a deployment that must not leak it
+      // passes `config.streamOnError` to replace it with a fixed string or an id.
+      const formatStreamError = config.streamOnError ?? ((e: unknown) => (e instanceof Error ? e.message : String(e)));
+      return result.toUIMessageStreamResponse({ headers: { "x-session-id": session.id }, onError: formatStreamError });
     })();
 
     responsePromise.catch(rejectDone);
-    void done.finally(() => handle.settle());
+    // Settle the turn handle when `done` settles, either way. The rejection is
+    // handled here (the onRejected arm), so the caller still sees `done` reject
+    // and handles its own copy, while this internal chain leaves none unhandled.
+    void done.then(() => handle.settle(), () => handle.settle());
 
     // `response` resolves to the UI message stream; a prepare failure rejects
     // it, and `done` carries the turn's own outcome. The caller awaits both.
@@ -461,6 +564,17 @@ function addUsage(a: Usage, b: Usage): Usage {
     costUsd: a.costUsd + b.costUsd,
     steps: a.steps + b.steps,
   };
+}
+
+/**
+ * The message a failed tool returned, or null for one that succeeded. AI SDK 6
+ * turns a tool that throws into a `tool-result` whose output is an error part;
+ * its value carries the message.
+ */
+function toolError(output: unknown): string | null {
+  const o = output as { type?: string; value?: unknown } | undefined;
+  if (!o || (o.type !== "error-text" && o.type !== "error-json")) return null;
+  return typeof o.value === "string" ? o.value : JSON.stringify(o.value);
 }
 
 function summaryOf(messages: ModelMessage[]): string | null {

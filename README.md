@@ -150,13 +150,18 @@ wrap-up prompts), from code or `loadRuntimeConfig(json)`.
   prompt up to the configured times, and a run that spends its steps gets the wrap-up prompt once.
 - `streamTurn(session, input)` returns `{ response, done }`: `response` resolves to a UI message
   stream carrying `x-session-id`, driven server-side so the turn finishes even if the client leaves;
-  `done` resolves to the turn's result once persisted.
+  `done` resolves to the turn's result once persisted. A failed turn tells the client the error's own
+  message by default; a deployment that must not leak it sets `config.streamOnError` to a formatter
+  that returns a fixed string or a request id instead.
 - The caller resolves the model (its keys, its routing) and passes the built `model` plus the `ref`
   (`provider/model`) that prices and sizes it. Each turn persists the transcript, splits and prices
   the usage onto the session and a per-turn row, records the tool calls, and finishes. A close
   through `runtime.turns.abort(sessionId)` cuts the stream and settles the turn as `closed`, not
   `errored`. `hooks` carry `onStepFinish`, `afterTurn` and `onError`, where a project writes a
-  failure journal, an incident or a span.
+  failure journal, an incident or a span. A turn is billed once on every path — finished, errored,
+  closed. The after-turn hooks (`context.afterTurn`, `hooks.afterTurn`) are side effects of an
+  already finished and billed turn: a throw from one is reported to `onError` and leaves the turn
+  finished, rather than re-billing it or turning it errored.
 
 ## Wiring memory and messaging
 

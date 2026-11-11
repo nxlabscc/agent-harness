@@ -9,6 +9,14 @@ export type RuntimeConfig = {
   continueOnCut: { prompt: string; times: number };
   /** A run that spends its budget is told this, with this many steps to close. */
   wrapUp: { prompt: string; steps: number };
+  /**
+   * How a streamed turn's failure reaches the client, as the body of the UI
+   * message stream. The default surfaces the error's own message; a deployment
+   * that must not leak it sets its own formatter — a fixed string, a request id.
+   * Set in code, not from JSON (a function), so `loadRuntimeConfig` leaves it
+   * unset and the default applies.
+   */
+  streamOnError?: (error: unknown) => string;
 };
 
 function requirePositiveInt(value: unknown, field: string): number {
