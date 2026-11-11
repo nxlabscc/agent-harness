@@ -6,7 +6,7 @@ import { computeUsage } from "../providers/usage";
 import type { AgentDefinition, AgentSource } from "../agents/types";
 import type { ToolRegistry } from "../tools/registry";
 import type { ToolEffect } from "../tools/types";
-import type { Scope, Session, SessionStore } from "../store/types";
+import { ZERO_USAGE, type Scope, type Session, type SessionStore, type Usage } from "../store/types";
 import { runToEnd, type RunResult } from "./continue";
 import { createTurnRegistry, type TurnRegistry } from "./turns";
 import type { RuntimeConfig } from "./config";
@@ -227,46 +227,50 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
   type Prepared = Awaited<ReturnType<typeof prepare>>;
   type TotalUsage = { inputTokens?: number; outputTokens?: number; inputTokenDetails?: { cacheReadTokens?: number; noCacheTokens?: number } } | undefined;
 
-  /** Record the tool calls of a turn from its persisted messages, pairing each result with its call's input and idx. */
-  async function recordToolCalls(session: Session, scope: Scope, persisted: StoredMessage[]): Promise<void> {
+  /**
+   * A per-message tool-call sink: feed it each message as it is persisted and it
+   * records a tool call once its result lands, pairing the result with its call's
+   * input and the idx of the message that made the call. Driven per message so the
+   * tool_calls table fills through the turn, the same as the transcript, rather
+   * than all at once at its close.
+   */
+  function toolCallRecorder(session: Session, scope: Scope): (idx: number, message: ModelMessage) => Promise<void> {
     const calls = new Map<string, { input: unknown; idx: number; toolName: string }>();
-    for (const { idx, message } of persisted) {
-      if (!Array.isArray(message.content)) continue;
-      for (const part of message.content) {
-        const p = part as { type?: string; toolCallId?: string; toolName?: string; input?: unknown };
-        if (p.type === "tool-call" && p.toolCallId) calls.set(p.toolCallId, { input: p.input, idx, toolName: p.toolName ?? "" });
+    return async (idx, message) => {
+      if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          const p = part as { type?: string; toolCallId?: string; toolName?: string; input?: unknown };
+          if (p.type === "tool-call" && p.toolCallId) calls.set(p.toolCallId, { input: p.input, idx, toolName: p.toolName ?? "" });
+        }
       }
-    }
-    for (const { message } of persisted) {
-      if (message.role !== "tool" || !Array.isArray(message.content)) continue;
+      if (message.role !== "tool" || !Array.isArray(message.content)) return;
       for (const part of message.content) {
         const p = part as { type?: string; toolCallId?: string; toolName?: string; output?: unknown };
         if (p.type !== "tool-result") continue;
         const call = p.toolCallId ? calls.get(p.toolCallId) : undefined;
         await store.recordToolCall(scope, {
           sessionId: session.id,
-          messageIdx: call?.idx ?? persisted[0]?.idx ?? 0,
+          messageIdx: call?.idx ?? idx,
           toolName: p.toolName ?? call?.toolName ?? "",
           input: call?.input,
           output: p.output,
           durationMs: 0,
         });
       }
-    }
+    };
   }
 
   /** Usage, cost, the finish, the tool calls, and the after-turn hooks. The messages are already persisted. */
   async function finalize(
     session: Session, p: Prepared, input: TurnInput<Extra>,
-    persisted: StoredMessage[], totalUsage: TotalUsage, finishReason: string | null, steps: number,
+    persisted: StoredMessage[], usage: Usage, finishReason: string | null,
   ): Promise<TurnResult> {
-    const { scope, firstAssistantIdx, prices, request, turnContext } = p;
-    const usage = computeUsage(prices, totalUsage ?? {}, steps);
+    const { scope, firstAssistantIdx, request, turnContext } = p;
     await store.addUsage(session.id, scope, usage);
     await store.recordTurnUsage(scope, {
       sessionId: session.id, turn: firstAssistantIdx - 1, provider: input.ref.provider, model: input.ref.model, usage,
     });
-    await recordToolCalls(session, scope, persisted);
+    // Tool calls were recorded as their results landed, so there is nothing to catch up here.
 
     const messages = persisted.filter((m) => m.idx >= firstAssistantIdx).map((m) => m.message);
     const summary = summaryOf(messages);
@@ -297,13 +301,34 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
     // the growing idx keep every message, in order.
     const persisted: StoredMessage[] = [];
     let nextIdx = p.firstAssistantIdx;
+    const recordTool = toolCallRecorder(session, p.scope);
     const appendPersisted = async (message: ModelMessage) => {
-      await store.appendMessage(session.id, p.scope, nextIdx, message);
-      persisted.push({ idx: nextIdx, message });
-      nextIdx++;
+      const at = nextIdx++;
+      await store.appendMessage(session.id, p.scope, at, message);
+      persisted.push({ idx: at, message });
+      await recordTool(at, message);
     };
+    // Usage and steps summed across every run of the turn. A cut-reply continue
+    // or a wrap-up calls generateText again, and each run reports only its own
+    // usage; runToEnd hands back the last run alone, so the totals are kept here
+    // — otherwise a wrapped-up turn would bill only its wrap-up steps.
+    let usage: Usage = ZERO_USAGE;
     try {
       const run = async (messages: ModelMessage[], steps: number) => {
+        // Persist each step's new messages as the step lands, so a turn in flight
+        // shows its transcript instead of only its opening message, and a run cut
+        // short keeps what it already produced. `response.messages` is cumulative,
+        // so only the tail past what is stored is appended. The writes are chained
+        // to stay ordered even if the SDK does not await the step hook, and the
+        // chain is settled before the run returns.
+        let persistedInRun = 0;
+        let chain: Promise<void> = Promise.resolve();
+        const flush = (cumulative: readonly ModelMessage[]): Promise<void> => {
+          chain = chain.then(async () => {
+            for (; persistedInRun < cumulative.length; persistedInRun++) await appendPersisted(cumulative[persistedInRun]!);
+          });
+          return chain;
+        };
         const result = await generateText({
           model: input.model,
           system: p.system,
@@ -312,11 +337,14 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
           abortSignal: handle.signal,
           stopWhen: stepCountIs(steps),
           prepareStep: ({ steps: done, messages: msgs }) => context.prepareStep?.({ steps: done, messages: msgs }, p.request),
-          onStepFinish: (step) => hooks?.onStepFinish?.(session, step.response.messages, p.turnContext),
+          onStepFinish: async (step) => {
+            await flush(step.response.messages);
+            hooks?.onStepFinish?.(session, step.response.messages, p.turnContext);
+          },
         });
-        // Persist this run's messages once it has resolved, so persistence is
-        // awaited and ordered rather than racing an un-awaited step hook.
-        for (const message of result.response.messages) await appendPersisted(message);
+        // Catch any tail the step hooks did not reach, then settle the chain.
+        await flush(result.response.messages);
+        usage = addUsage(usage, computeUsage(p.prices, result.totalUsage as TotalUsage ?? {}, result.steps.length));
         return result;
       };
 
@@ -327,8 +355,8 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
         appendPersisted,
         { continueOnCut: config.continueOnCut, wrapUp: config.wrapUp },
       );
-      const r = result as unknown as { totalUsage?: TotalUsage; finishReason?: string; steps: unknown[] };
-      return await finalize(session, p, input, persisted, r.totalUsage, r.finishReason ?? null, r.steps.length);
+      const r = result as unknown as { finishReason?: string };
+      return await finalize(session, p, input, persisted, usage, r.finishReason ?? null);
     } catch (err) {
       if (turns.abortedByClose(session.id)) {
         await store.finish(session.id, p.scope, { status: "finished", finishReason: "closed", summary: "Turn stopped: the session was closed." });
@@ -349,6 +377,26 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
 
     const responsePromise = (async (): Promise<Response> => {
       const p = await prepare(session, input);
+      // Persist each step as it lands, the same as the automated path, so a
+      // streamed turn's transcript fills in the store as it goes rather than only
+      // at close. `response.messages` is cumulative; the chain keeps writes ordered.
+      const persisted: StoredMessage[] = [];
+      let streamIdx = p.firstAssistantIdx;
+      let persistedInRun = 0;
+      let chain: Promise<void> = Promise.resolve();
+      const recordTool = toolCallRecorder(session, p.scope);
+      const flush = (cumulative: readonly ModelMessage[]): Promise<void> => {
+        chain = chain.then(async () => {
+          for (; persistedInRun < cumulative.length; persistedInRun++) {
+            const message = cumulative[persistedInRun]!;
+            const at = streamIdx++;
+            await store.appendMessage(session.id, p.scope, at, message);
+            persisted.push({ idx: at, message });
+            await recordTool(at, message);
+          }
+        });
+        return chain;
+      };
       const result = streamText({
         model: input.model,
         system: p.system,
@@ -357,7 +405,10 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
         abortSignal: handle.signal,
         stopWhen: stepCountIs(input.maxSteps ?? config.maxSteps.stream),
         prepareStep: ({ steps, messages }) => context.prepareStep?.({ steps, messages }, p.request),
-        onStepFinish: (step) => hooks?.onStepFinish?.(session, step.response.messages, p.turnContext),
+        onStepFinish: async (step) => {
+          await flush(step.response.messages);
+          hooks?.onStepFinish?.(session, step.response.messages, p.turnContext);
+        },
         onError: ({ error }) => {
           if (turns.abortedByClose(session.id)) {
             void store.finish(session.id, p.scope, { status: "finished", finishReason: "closed", summary: "Turn stopped: the session was closed." });
@@ -368,14 +419,12 @@ export function createRuntime<Extra>(opts: RuntimeOptions<Extra>): Runtime<Extra
         },
         onFinish: ({ response, totalUsage, finishReason, steps }) => {
           void (async () => {
-            const persisted: StoredMessage[] = [];
-            let idx = p.firstAssistantIdx;
-            for (const message of response.messages) {
-              await store.appendMessage(session.id, p.scope, idx, message);
-              persisted.push({ idx, message });
-              idx++;
-            }
-            return finalize(session, p, input, persisted, totalUsage as TotalUsage, finishReason ?? null, steps.length);
+            // Catch any tail the step hooks did not reach, then finalize on the
+            // transcript the chain already persisted. The streamed path is a single
+            // run (no cut-reply/wrap-up continuation), so its usage is computed once.
+            await flush(response.messages);
+            const usage = computeUsage(p.prices, totalUsage as TotalUsage ?? {}, steps.length);
+            return finalize(session, p, input, persisted, usage, finishReason ?? null);
           })().then(settleDone, rejectDone);
         },
       });
@@ -400,6 +449,18 @@ function lastUserText(messages: ModelMessage[]): string {
     if (messages[i]!.role === "user") return textOf(messages[i]!.content);
   }
   return "";
+}
+
+/** Sum two usage tallies field by field, so a multi-run turn bills the whole of it. */
+function addUsage(a: Usage, b: Usage): Usage {
+  return {
+    tokensIn: a.tokensIn + b.tokensIn,
+    tokensOut: a.tokensOut + b.tokensOut,
+    cacheHit: a.cacheHit + b.cacheHit,
+    cacheMiss: a.cacheMiss + b.cacheMiss,
+    costUsd: a.costUsd + b.costUsd,
+    steps: a.steps + b.steps,
+  };
 }
 
 function summaryOf(messages: ModelMessage[]): string | null {

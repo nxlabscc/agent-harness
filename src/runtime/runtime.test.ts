@@ -134,6 +134,56 @@ test("a cut reply is handed back, and the model recovers on the next prompt", as
   expect((await store.getSession(session.id, scope))!.status).toBe("finished");
 });
 
+test("a multi-run turn bills every run, not just the last", async () => {
+  const { store, runtime } = setup();
+  const session = await runtime.openSession({ agent: "assistant", scope, trigger: "cron" });
+  // The first reply is cut (reasoning only), so the turn runs generateText twice:
+  // the cut run and the continue run. Each stub run outputs 4 tokens over one step.
+  // The turn must bill BOTH — 8 out over 2 steps — not only the last run, which a
+  // lost-usage slip (runToEnd handing back just its final result) reports as 4/1.
+  await runtime.runTurn(session, { content: "REASON", model: stubModel(), ref, extra: {} });
+
+  const after = (await store.getSession(session.id, scope))!;
+  expect(after.usage.tokensOut).toBe(8);
+  expect(after.usage.steps).toBe(2);
+  const turns = await store.listTurnUsage(session.id, scope);
+  expect(turns).toHaveLength(1);
+  expect(turns[0]!.usage.tokensOut).toBe(8);
+  expect(turns[0]!.usage.steps).toBe(2);
+});
+
+test("runTurn persists each step as it lands, not only at close", async () => {
+  // listMessages reads the store at call time, so a snapshot taken when a step's
+  // hook fires shows exactly what was persisted by that step.
+  const snaps: Promise<number>[] = [];
+  const { store, runtime } = setup({
+    hooks: { onStepFinish: (session) => { snaps.push(store.listMessages(session.id, scope).then((m) => m.length)); } },
+  });
+  const session = await runtime.openSession({ agent: "helper", scope, trigger: "cron" });
+  await runtime.runTurn(session, { content: 'TOOLCALL greet {"name":"ada"}', model: stubModel(), ref, extra: {} });
+
+  // Two steps: step 1 (user's reply: assistant tool-call + tool result), step 2 (final text).
+  // By the time step 1's hook fires, its messages are already stored — [system, user,
+  // assistant, tool] is four. Persist-at-close would hold the store at [system, user]
+  // until the whole turn ended, so the first snapshot would be two.
+  const counts = await Promise.all(snaps);
+  expect(counts[0]).toBeGreaterThanOrEqual(4);
+});
+
+test("runTurn records a tool call as its result lands, not only at close", async () => {
+  const snaps: Promise<number>[] = [];
+  const { store, runtime } = setup({
+    hooks: { onStepFinish: (session) => { snaps.push(store.listToolCalls(session.id, scope).then((c) => c.length)); } },
+  });
+  const session = await runtime.openSession({ agent: "helper", scope, trigger: "cron" });
+  await runtime.runTurn(session, { content: 'TOOLCALL greet {"name":"ada"}', model: stubModel(), ref, extra: {} });
+
+  // The tool result lands in step 1, so its row is in the store by step 1's hook.
+  // Recording only at finalize would leave the first snapshot at zero.
+  const counts = await Promise.all(snaps);
+  expect(counts[0]).toBe(1);
+});
+
 test("a provider failure ends the turn errored, classified, and calls the error hook", async () => {
   const errors: string[] = [];
   const { store, runtime } = setup({ hooks: { onError: (err) => { errors.push((err as Error).message); } } });
